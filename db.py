@@ -3,9 +3,55 @@ import os
 import json
 from typing import Any, Dict
 import aiosqlite
-
+from typing import Iterable
 # Путь к базе: берём из .env или по умолчанию bot.db
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
+ACTIVE_STATUSES = ("Submitted", "PreSubmitted", "PendingSubmit", "Inactive")
+
+async def is_whitelisted(symbol: str) -> bool:
+    q = "SELECT 1 FROM white_list WHERE UPPER(pair)=UPPER(?) LIMIT 1"
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(q, (symbol,)) as cur:
+            return await cur.fetchone() is not None
+
+async def has_active_order(symbol: str) -> bool:
+    q = f"""
+    SELECT 1
+    FROM orders
+    WHERE UPPER(symbol)=UPPER(?)
+      AND status IN ({",".join("?"*len(ACTIVE_STATUSES))})
+    LIMIT 1
+    """
+    params = (symbol, *ACTIVE_STATUSES)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(q, params) as cur:
+            return await cur.fetchone() is not None
+
+async def mark_order_killed(perm_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE orders SET status='Killed', updated_at=CURRENT_TIMESTAMP WHERE permId=?", (perm_id,))
+        await db.commit()
+
+async def mark_missing_open_orders_as_killed(active_perm_ids: Iterable[int]) -> int:
+    """
+    Всё активное в БД, чего нет среди активных в IB → пометить Killed.
+    Вернёт кол-во помеченных строк.
+    """
+    ids = list(int(x) for x in active_perm_ids if x)
+    placeholders = ",".join("?"*len(ids)) if ids else ""
+    base = f"status IN ({','.join('?'*len(ACTIVE_STATUSES))})"
+    if ids:
+        sql = f"UPDATE orders SET status='Killed', updated_at=CURRENT_TIMESTAMP WHERE {base} AND permId NOT IN ({placeholders})"
+        params = (*ACTIVE_STATUSES, *ids)
+    else:
+        sql = f"UPDATE orders SET status='Killed', updated_at=CURRENT_TIMESTAMP WHERE {base}"
+        params = (*ACTIVE_STATUSES,)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(sql, params)
+        await db.commit()
+        return cur.rowcount
+
 
 # ---------- схемы ----------
 CREATE_SYMBOLS_SQL = """
